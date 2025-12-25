@@ -9,14 +9,13 @@ import os
 import uuid
 from pathlib import Path
 from openai import OpenAI
-import tempfile
 import shutil
 from helper import get_openai_api_key
 
 # Initialize FastAPI app
 app = FastAPI(
     title="CSV Agent API",
-    description="An AI agent that can analyze CSV datasets, generate SQL queries, and create visualizations",
+    description="An AI agent that can answer general questions and analyze CSV datasets when provided",
     version="1.0.0"
 )
 
@@ -43,14 +42,15 @@ active_sessions = {}
 
 # Pydantic models
 class ChatRequest(BaseModel):
-    session_id: str
+    session_id: Optional[str] = None  # Now optional
     message: str
 
 
 class ChatResponse(BaseModel):
-    session_id: str
+    session_id: Optional[str] = None
     response: str
     visualization_code: Optional[str] = None
+    mode: str  # "general" or "data_analysis"
 
 
 class SessionInfo(BaseModel):
@@ -93,9 +93,18 @@ Use matplotlib and pandas. The data is already loaded as a pandas DataFrame call
 config: {config}
 """
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_WITH_DATA = """
 You are a helpful assistant that can answer questions about the user's uploaded dataset.
 You have access to tools for database lookup, data analysis, and visualization generation.
+The user has uploaded a dataset, so you can use the data analysis tools when needed.
+"""
+
+SYSTEM_PROMPT_GENERAL = """
+You are a helpful AI assistant. You can answer general questions, help with various tasks, 
+and provide information on a wide range of topics.
+
+If the user wants to analyze data, inform them that they can upload a CSV file to enable 
+data analysis features including SQL queries, data analysis, and visualization generation.
 """
 
 
@@ -120,8 +129,8 @@ def lookup_given_dataset(prompt: str, session_id: str) -> str:
     """Implementation of dataset lookup using SQL"""
     try:
         session = active_sessions.get(session_id)
-        if not session:
-            return "Error: No active session found. Please upload a dataset first."
+        if not session or "dataset_path" not in session:
+            return "Error: No dataset found. Please upload a CSV file first to use data analysis features."
         
         dataset_path = session["dataset_path"]
         table_name = session["table_name"]
@@ -210,7 +219,7 @@ def generate_visualization(data: str, visualization_goal: str) -> str:
     return code
 
 
-# Tool definitions for OpenAI
+# Tool definitions for OpenAI (only used when dataset is available)
 tools = [
     {
         "type": "function",
@@ -295,14 +304,14 @@ def handle_tool_calls(tool_calls, messages, session_id):
     return messages
 
 
-def run_agent(messages, session_id):
-    """Main agent loop"""
+def run_agent_with_data(messages, session_id):
+    """Agent with data analysis capabilities"""
     if isinstance(messages, str):
         messages = [{"role": "user", "content": messages}]
         
-    # Add system prompt if needed
+    # Add system prompt for data mode
     if not any(msg.get("role") == "system" for msg in messages):
-        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT})
+        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT_WITH_DATA})
 
     visualization_code = None
     
@@ -326,6 +335,23 @@ def run_agent(messages, session_id):
             messages = handle_tool_calls(tool_calls, messages, session_id)
         else:
             return response.choices[0].message.content, visualization_code
+
+
+def run_agent_general(messages):
+    """Agent for general conversation without data tools"""
+    if isinstance(messages, str):
+        messages = [{"role": "user", "content": messages}]
+        
+    # Add system prompt for general mode
+    if not any(msg.get("role") == "system" for msg in messages):
+        messages.insert(0, {"role": "system", "content": SYSTEM_PROMPT_GENERAL})
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=messages,
+    )
+    
+    return response.choices[0].message.content, None
 
 
 # API Endpoints
@@ -370,30 +396,57 @@ async def upload_dataset(file: UploadFile = File(...)):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Send a message to the agent"""
-    if request.session_id not in active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+    """Send a message to the agent (works with or without uploaded data)"""
+    
+    # Determine mode: data analysis or general conversation
+    has_data = request.session_id and request.session_id in active_sessions
     
     try:
-        session = active_sessions[request.session_id]
-        
-        # Add user message to conversation history
-        session["messages"].append({"role": "user", "content": request.message})
-        
-        # Run agent
-        response_text, viz_code = run_agent(
-            session["messages"].copy(), 
-            request.session_id
-        )
-        
-        # Update conversation history
-        session["messages"].append({"role": "assistant", "content": response_text})
-        
-        return ChatResponse(
-            session_id=request.session_id,
-            response=response_text,
-            visualization_code=viz_code
-        )
+        if has_data:
+            # Data analysis mode with tools
+            session = active_sessions[request.session_id]
+            
+            # Add user message to conversation history
+            session["messages"].append({"role": "user", "content": request.message})
+            
+            # Run agent with data tools
+            response_text, viz_code = run_agent_with_data(
+                session["messages"].copy(), 
+                request.session_id
+            )
+            
+            # Update conversation history
+            session["messages"].append({"role": "assistant", "content": response_text})
+            
+            return ChatResponse(
+                session_id=request.session_id,
+                response=response_text,
+                visualization_code=viz_code,
+                mode="data_analysis"
+            )
+        else:
+            # General conversation mode without tools
+            # Create a temporary session for conversation history if needed
+            temp_session_id = "general_" + str(uuid.uuid4())
+            
+            if temp_session_id not in active_sessions:
+                active_sessions[temp_session_id] = {"messages": []}
+            
+            temp_session = active_sessions[temp_session_id]
+            temp_session["messages"].append({"role": "user", "content": request.message})
+            
+            # Run agent in general mode
+            response_text, viz_code = run_agent_general(temp_session["messages"].copy())
+            
+            # Update conversation history
+            temp_session["messages"].append({"role": "assistant", "content": response_text})
+            
+            return ChatResponse(
+                session_id=temp_session_id,
+                response=response_text,
+                visualization_code=viz_code,
+                mode="general"
+            )
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing message: {str(e)}")
@@ -406,6 +459,11 @@ async def get_session(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     
     session = active_sessions[session_id]
+    
+    # Check if this is a data session or general session
+    if "dataset_path" not in session:
+        raise HTTPException(status_code=400, detail="This is a general conversation session, not a data session")
+    
     return SessionInfo(
         session_id=session_id,
         filename=session["filename"],
@@ -423,10 +481,11 @@ async def delete_session(session_id: str):
     try:
         session = active_sessions[session_id]
         
-        # Delete uploaded file
-        file_path = Path(session["dataset_path"])
-        if file_path.exists():
-            file_path.unlink()
+        # Delete uploaded file if it exists
+        if "dataset_path" in session:
+            file_path = Path(session["dataset_path"])
+            if file_path.exists():
+                file_path.unlink()
         
         # Remove session
         del active_sessions[session_id]
@@ -437,16 +496,34 @@ async def delete_session(session_id: str):
         raise HTTPException(status_code=500, detail=f"Error deleting session: {str(e)}")
 
 
+@app.post("/session/create")
+async def create_general_session():
+    """Create a new general conversation session without uploading data"""
+    session_id = "general_" + str(uuid.uuid4())
+    active_sessions[session_id] = {"messages": []}
+    
+    return {
+        "session_id": session_id,
+        "mode": "general",
+        "message": "General conversation session created. Upload a CSV file to enable data analysis features."
+    }
+
+
 @app.get("/")
 async def root():
     """Root endpoint"""
     return {
         "message": "CSV Agent API",
         "version": "1.0.0",
+        "modes": {
+            "general": "Chat without data - general AI assistant",
+            "data_analysis": "Chat with uploaded CSV - full data analysis capabilities"
+        },
         "endpoints": {
-            "upload": "POST /upload - Upload a CSV file",
-            "chat": "POST /chat - Chat with the agent",
-            "session": "GET /session/{session_id} - Get session info",
+            "upload": "POST /upload - Upload a CSV file (optional)",
+            "chat": "POST /chat - Chat with the agent (works with or without data)",
+            "create_session": "POST /session/create - Create general session",
+            "session": "GET /session/{session_id} - Get session info (data sessions only)",
             "delete": "DELETE /session/{session_id} - Delete session"
         }
     }
