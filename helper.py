@@ -11,6 +11,10 @@ def get_openai_api_key():
     openai_api_key = os.getenv("OPENAI_API_KEY")
     return openai_api_key
 
+def get_groq_api_key():
+    load_env()
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    return groq_api_key
 
 def get_phoenix_endpoint():
     load_env()
